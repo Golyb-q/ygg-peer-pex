@@ -1,6 +1,6 @@
 # Yggdrasil PEX
 
-Автоматический обмен пирами для [Yggdrasil](https://yggdrasil-network.github.io/).
+Автоматический обмен публичными пирами `Peers:[]` для [Yggdrasil](https://yggdrasil-network.github.io/).
 
 Находит пиры через `NodeInfo`, проверяет, сохраняет рабочие и делится ими через свой `NodeInfo`.
 
