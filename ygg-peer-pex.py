@@ -486,11 +486,7 @@ def add_if_working(uri, config, wait, dns_cache=None, backup_enabled=False):
 
 
 
-# A managed PEX stanza is separated from the standard "public" advertisement.
-# It contains working *remote* peer URIs, not a claimed listener on this node.
-PEX_BEGIN = '# BEGIN ygg-peer-add managed PEX'
-PEX_END = '# END ygg-peer-add managed PEX'
-
+# PEX owns NodeInfo.pex.internet, independently of comments.
 
 def nodeinfo_section(config):
     """Locate one NodeInfo: { ... } block, refusing ambiguous layouts.
@@ -538,46 +534,41 @@ def nodeinfo_section(config):
     raise ValueError('Unclosed NodeInfo section')
 
 
-def replace_pex_block(config, uris):
-    """Update only our own PEX field. Refuse to overwrite somebody else's PEX."""
-    match, start, end = nodeinfo_section(config)
-    body = config[start+1:end]
-    begin_at, end_at = body.find(PEX_BEGIN), body.find(PEX_END)
-    if (begin_at == -1) != (end_at == -1):
-        raise ValueError('Incomplete managed PEX markers; leaving config unchanged')
-    if begin_at >= 0:
-        if body.count(PEX_BEGIN) != 1 or body.count(PEX_END) != 1 or end_at < begin_at:
-            raise ValueError('Ambiguous managed PEX markers; leaving config unchanged')
-        # Remove whole marker lines, preserving the rest of NodeInfo.
-        line_start = body.rfind('\n', 0, begin_at) + 1
-        line_end = body.find('\n', end_at)
-        if line_end < 0:
-            line_end = len(body)
-        else:
-            line_end += 1
-        remainder = body[:line_start] + body[line_end:]
-    else:
-        remainder = body
-        if re.search(r'(?m)^\s*(?:"pex"|pex)\s*:', remainder):
-            raise ValueError('NodeInfo already contains an unmanaged pex field')
-
-    # The 16 KiB NodeInfo limit includes other user fields and build metadata.
-    # Leave ample headroom; the config validator is an additional safeguard.
-    if len(uris) > 64:
-        uris = uris[:64]
-    pex_json = json.dumps({'internet': uris}, indent=2, ensure_ascii=False)
-    indent = match.group(0).split('NodeInfo')[0]
-    indent = re.match(r'[ \t]*', match.group(0)).group(0) + '  '
-    field = json.dumps('pex') + ': ' + pex_json.replace('\n', '\n' + indent)
-    stanza = f'{indent}{PEX_BEGIN}\n{indent}{field}\n{indent}{PEX_END}\n'
-    # An empty URIs list clears prior managed PEX to avoid publishing stale data.
-    replacement_body = remainder
-    if uris:
-        replacement_body = remainder.rstrip() + '\n' + stanza
-    updated = config[:start+1] + replacement_body + config[end:]
-    if len(updated[start:end].encode('utf-8')) > 13500:
+def replace_pex_block(config, uris, nodeinfo):
+    """Update the PEX internet list using parsed NodeInfo, not comment markers."""
+    if not isinstance(nodeinfo, dict):
+        raise ValueError('NodeInfo must be an object')
+    uris = sorted(set(uris))[:64]
+    pex = nodeinfo.get('pex', {})
+    if not isinstance(pex, dict):
+        raise ValueError('NodeInfo.pex must be an object; config unchanged')
+    if 'internet' in pex and pex['internet'] == uris:
+        return config
+    if 'internet' not in pex and not uris:
+        return config
+    updated_info = dict(nodeinfo)
+    updated_info['pex'] = dict(pex, internet=uris)
+    rendered = json.dumps(updated_info, indent=2, ensure_ascii=False, allow_nan=False)
+    if len(rendered.encode('utf-8')) > 13500:
         raise ValueError('NodeInfo could be too large; refusing to publish')
-    return updated
+    match, start, end = nodeinfo_section(config)
+    indent = re.match(r'[ \t]*', match.group(0)).group(0)
+    rendered = rendered.replace('\n', '\n' + indent)
+    return config[:start] + rendered + config[end+1:]
+
+
+def read_nodeinfo(path):
+    """Use Yggdrasil itself to parse HJSON; never log config or private keys."""
+    result = run('yggdrasil', '-normaliseconf', '-useconffile', str(path), '-json')
+    if result.returncode:
+        raise RuntimeError('Yggdrasil could not parse config as JSON')
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        raise RuntimeError('Yggdrasil did not return valid configuration JSON') from None
+    if not isinstance(payload, dict) or not isinstance(payload.get('NodeInfo'), dict):
+        raise ValueError('Normalized configuration has no NodeInfo object')
+    return payload['NodeInfo']
 
 
 def active_public_peers():
@@ -588,47 +579,22 @@ def active_public_peers():
 
 
 def publish_active(path, backup_enabled=False):
-    """Persist a managed NodeInfo. Needs service restart to become visible."""
+    """Persist NodeInfo.pex.internet; restart is needed to advertise changes."""
     if path.is_symlink():
         raise RuntimeError('Refusing to rewrite a symlinked config')
     original = path.read_bytes()
     config = original.decode('utf-8')
+    nodeinfo = read_nodeinfo(path)
     uris = active_public_peers()
-    updated = replace_pex_block(config, uris)
+    if path.read_bytes() != original:
+        raise RuntimeError('Config changed during PEX read; aborting')
+    updated = replace_pex_block(config, uris, nodeinfo)
     if updated == config:
         print(f'PEX already current ({len(uris)} live URIs)')
         return False
-    st = path.stat()
-    tempname = None
-    try:
-        fd, tempname = tempfile.mkstemp(prefix='.ygg-conf-', dir=str(path.parent))
-        with os.fdopen(fd, 'wb') as out:
-            out.write(updated.encode('utf-8'))
-            out.flush()
-            os.fsync(out.fileno())
-        os.chown(tempname, st.st_uid, st.st_gid)
-        os.chmod(tempname, stat.S_IMODE(st.st_mode))
-        check = run('yggdrasil', '-normaliseconf', '-useconffile', tempname)
-        if check.returncode:
-            raise RuntimeError('Yggdrasil rejected NodeInfo change: ' + (check.stderr or check.stdout).strip())
-        backup = None
-        if backup_enabled:
-            backup = path.with_name(f'{path.name}.bak-{time.strftime("%Y%m%d-%H%M%S")}-{os.getpid()}-pex')
-            with open(backup, 'xb') as out:
-                os.fchmod(out.fileno(), 0o600)
-                out.write(original)
-                out.flush()
-                os.fsync(out.fileno())
-        os.replace(tempname, path)
-        tempname = None
-        print(f'Updated NodeInfo pex.internet with {len(uris)} Up Internet URIs')
-        if backup:
-            print(f'Backup: {backup} (mode 0600)')
-        return True
-    finally:
-        if tempname and os.path.exists(tempname):
-            os.unlink(tempname)
-
+    validate_and_replace(path, original, updated, backup_enabled, 'pex')
+    print(f'Updated NodeInfo pex.internet with {min(len(uris), 64)} Up Internet URIs')
+    return True
 
 
 def restart_yggdrasil():
