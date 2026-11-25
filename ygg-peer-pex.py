@@ -15,7 +15,35 @@ import tempfile
 import time
 from urllib.parse import urlsplit
 
-DEFAULT_CONFIG = Path('/etc/yggdrasil.conf')
+CONFIG_CANDIDATES = (Path('/etc/yggdrasil.conf'), Path('/etc/yggdrasil/yggdrasil.conf'))
+
+
+def detect_config(explicit=None):
+    """Prefer explicit path, then effective systemd ExecStart, then known paths."""
+    if explicit is not None:
+        path = Path(explicit).absolute()
+    else:
+        path = None
+        try:
+            result = run('systemctl', 'show', 'yggdrasil.service', '-p', 'ExecStart', '--value')
+            if result.returncode == 0:
+                matches = re.findall(r'-useconffile(?:=|\s+)(?:"([^"\n]+)"|([^\s;]+))', result.stdout)
+                paths = {a or b for a, b in matches}
+                if len(paths) == 1:
+                    path = Path(paths.pop())
+                elif len(paths) > 1:
+                    raise RuntimeError('Multiple service config paths; specify --config')
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        if path is None:
+            candidates = [p for p in CONFIG_CANDIDATES if p.is_file()]
+            if len(candidates) != 1:
+                raise RuntimeError('Cannot uniquely locate Yggdrasil config; specify --config')
+            path = candidates[0]
+    if not path.is_file() or path.is_symlink():
+        raise RuntimeError(f'Config missing or symlinked: {path}')
+    return path
+
 
 
 def run(*args, timeout=20):
@@ -96,19 +124,69 @@ def configured_uris(config):
     return set(re.findall(r'(?m)^\s*["\']([^"\']+)["\']\s*,?\s*(?:(?://|#).*?)?$', body))
 
 
+def parse_peer_table(text):
+    """Handle bordered, tab-separated and whitespace-separated CLI tables."""
+    result = {}
+    header = False
+    for line in text.splitlines():
+        if re.search(r'\bURI\b', line, re.I) and re.search(r'\bState\b', line, re.I):
+            header = True
+        match = re.match(r'^\s*[│|]?\s*(\S+?)\s*(?:[│|]\s*|\s+)(Up|Down)(?=\s|[│|]|$)', line, re.I)
+        if match and valid_uri(match[1]):
+            uri, state = match[1], match[2].capitalize()
+            if uri in result and result[uri] != state:
+                raise RuntimeError(f'Conflicting states for {uri}')
+            result[uri] = state
+    if not result and not header:
+        raise RuntimeError('Unrecognized getPeers table; refusing config changes')
+    # An empty or unfamiliar table must not erase PEX or prune peers.
+    if not result:
+        raise RuntimeError('No recognizable peer rows; refusing config changes')
+    return result
+
+
+def parse_peer_json(text):
+    data = json.loads(text)
+    if not isinstance(data, dict) or 'peers' not in data:
+        raise ValueError('Unknown getPeers JSON shape')
+    peers = data['peers']
+    if not isinstance(peers, (list, dict)):
+        raise ValueError('Unknown peers collection')
+    result = {}
+    for key, row in (peers.items() if isinstance(peers, dict) else enumerate(peers)):
+        if not isinstance(row, dict):
+            raise ValueError('Unknown peer row')
+        fields = {k.lower(): v for k, v in row.items()}
+        uri = fields.get('uri', fields.get('remote', key))
+        if not isinstance(uri, str) or not valid_uri(uri):
+            continue
+        up = fields.get('up', fields.get('state'))
+        if isinstance(up, bool):
+            state = 'Up' if up else 'Down'
+        elif isinstance(up, str) and up.lower() in ('up', 'down'):
+            state = up.capitalize()
+        else:
+            raise ValueError('Unknown peer state')
+        if uri in result and result[uri] != state:
+            raise ValueError('Conflicting peer states')
+        result[uri] = state
+    if not result:
+        raise ValueError('No recognizable JSON peer rows')
+    return result
+
+
 def peer_states():
-    """Read the current exact transport URI -> state map from the Admin API."""
+    """Prefer machine-readable API; fall back to compatible CLI tables."""
+    p = run('yggdrasilctl', '-json', 'getPeers', timeout=20)
+    if not p.returncode:
+        try:
+            return parse_peer_json(p.stdout)
+        except ValueError:
+            pass
     p = run('yggdrasilctl', 'getPeers', timeout=20)
     if p.returncode:
         raise RuntimeError(p.stderr.strip() or p.stdout.strip() or 'getPeers failed')
-    result = {}
-    for line in p.stdout.splitlines():
-        parts = line.split('│')
-        if len(parts) > 3:
-            uri, state = parts[1].strip(), parts[2].strip()
-            if valid_uri(uri) and state in ('Up', 'Down'):
-                result[uri] = state
-    return result
+    return parse_peer_table(p.stdout)
 
 
 def prune_config_text(config, to_remove):
@@ -154,8 +232,8 @@ def prune_down(path, backup_enabled=False, recheck_seconds=3):
     if not to_remove:
         print('Prune: no peers remain Down after recheck')
         return False
-    if len(entries - to_remove) == 0:
-        print('Prune: refusing to remove all configured peers', flush=True)
+    if not any(latest.get(uri) == 'Up' for uri in entries - to_remove):
+        print('Prune: refusing to prune without a confirmed Up configured peer', flush=True)
         return False
     # One more read protects against a concurrent change in the config file.
     if path.read_bytes() != original:
@@ -204,14 +282,7 @@ def validate_and_replace(path, original, updated, backup_enabled, tag):
 
 
 def state_for(uri):
-    p = run('yggdrasilctl', 'getPeers')
-    if p.returncode:
-        raise RuntimeError(p.stderr.strip() or p.stdout.strip() or 'getPeers failed')
-    for line in p.stdout.splitlines():
-        parts = line.split('│')
-        if len(parts) > 3 and parts[1].strip() == uri:
-            return parts[2].strip()
-    return None
+    return peer_states().get(uri)
 
 
 def insert_peer(config, uri):
@@ -511,19 +582,9 @@ def replace_pex_block(config, uris):
 
 def active_public_peers():
     """Collect only currently Up, usable Internet transport URIs."""
-    r = run('yggdrasilctl', 'getPeers', timeout=20)
-    if r.returncode:
-        raise RuntimeError('getPeers failed: ' + (r.stderr or r.stdout).strip())
-    found = set()
     dns_cache = {}
-    for line in r.stdout.splitlines():
-        parts = line.split('│')
-        if len(parts) < 4:
-            continue
-        uri, state = parts[1].strip(), parts[2].strip()
-        if state == 'Up' and is_public_transport(uri, dns_cache):
-            found.add(uri)
-    return sorted(found)
+    return sorted(uri for uri, state in peer_states().items()
+                  if state == 'Up' and is_public_transport(uri, dns_cache))
 
 
 def publish_active(path, backup_enabled=False):
@@ -627,20 +688,25 @@ def systemctl(*args):
         raise RuntimeError(f'systemctl {" ".join(args)} failed: ' + (result.stderr or result.stdout).strip())
 
 
-def configured_service_text(restart=False):
-    if restart:
-        return SERVICE_TEXT.replace(' --discover --prune-down\n', ' --discover --prune-down --restart\n')
-    return SERVICE_TEXT
+def configured_service_text(restart=False, config=None):
+    path = str(detect_config(config))
+    if any(ord(c) < 32 for c in path):
+        raise RuntimeError('Invalid config path for systemd')
+    quoted = '"' + path.replace('\\', '\\\\').replace('"', '\\"').replace('%', '%%').replace('$', '$$') + '"'
+    flags = ' --discover --prune-down' + (' --restart' if restart else '') + ' --config ' + quoted
+    return SERVICE_TEXT.replace(' --discover --prune-down\n', flags + '\n')
 
 
-def install_service(restart=False):
+def install_service(restart=False, config=None):
+    config = detect_config(config)
+    print(f'Using Yggdrasil config: {config}')
     if not Path('/run/systemd/system').exists():
         raise RuntimeError('systemd system manager not found')
     source = Path(__file__).resolve()
     if not source.is_file():
         raise RuntimeError('Cannot find the script to install')
     # Recognize and upgrade the previous PEX units without clobbering unrelated units.
-    for unit, expected in ((SERVICE_PATH, configured_service_text(restart)), (TIMER_PATH, TIMER_TEXT)):
+    for unit, expected in ((SERVICE_PATH, configured_service_text(restart, config)), (TIMER_PATH, TIMER_TEXT)):
         if unit.exists() and unit.read_text() != expected:
             previous = unit.read_text()
             if 'ygg-peer-pex.py' not in previous and 'Yggdrasil PEX' not in previous:
@@ -654,7 +720,7 @@ def install_service(restart=False):
         if installed != source.read_bytes():
             print('Updating previously installed script in /usr/local/libexec/', flush=True)
     write_install_file(INSTALL_PATH, source.read_bytes(), 0o755)
-    write_install_file(SERVICE_PATH, configured_service_text(restart).encode(), 0o644)
+    write_install_file(SERVICE_PATH, configured_service_text(restart, config).encode(), 0o644)
     write_install_file(TIMER_PATH, TIMER_TEXT.encode(), 0o644)
     systemctl('daemon-reload')
     # Never wait for a long-running PEX scan when activating a timer.
@@ -690,7 +756,7 @@ def uninstall_service():
         if path.exists():
             path.unlink()
     systemctl('daemon-reload')
-    print('Uninstalled timer and script. /etc/yggdrasil.conf was not changed.')
+    print('Uninstalled timer and script. Yggdrasil config was not changed.')
 
 
 def main():
@@ -702,7 +768,7 @@ def main():
     parser.add_argument('--prune-down', action='store_true', help='Remove confirmed Down URIs from config; never remove all')
     parser.add_argument('--max-new', type=int, default=None, help='Optional limit on new peers saved (default: unlimited)')
     parser.add_argument('--max-nodes', type=int, default=None, help='Optional limit on nodes queried (default: all getTree nodes)')
-    parser.add_argument('--config', type=Path, default=DEFAULT_CONFIG)
+    parser.add_argument('--config', type=Path, default=None, help='Config path (default: auto-detect)')
     parser.add_argument('--backup', action='store_true', help='Create timestamped backup before config edits (off by default)')
     parser.add_argument('--timeout', type=int, default=12, help='Seconds to wait for a candidate to become Up')
     parser.add_argument('--restart', action='store_true', help='Restart Yggdrasil after cycle only if config was modified')
@@ -715,7 +781,7 @@ def main():
             parser.error('install/uninstall cannot be mixed with discovery flags')
         try:
             if args.uri == 'install':
-                install_service(restart=args.restart or args.restart_on_publish)
+                install_service(restart=args.restart or args.restart_on_publish, config=args.config)
             else:
                 uninstall_service()
             return 0
@@ -732,8 +798,10 @@ def main():
         parser.error('--max-new and --max-nodes must be positive when specified')
     if os.geteuid() != 0:
         parser.error('Run with sudo to access socket and modify config')
-    if not args.config.is_file():
-        parser.error(f'Config not found: {args.config}')
+    try:
+        args.config = detect_config(args.config)
+    except (RuntimeError, OSError) as exc:
+        parser.error(str(exc))
     try:
         insert_peer(args.config.read_text('utf-8'), 'tls://example.com:1234')
         nodeinfo_section(args.config.read_text('utf-8'))
